@@ -1,0 +1,197 @@
+import time
+import datetime
+import requests
+import pyupbit
+import pandas as pd
+import ccxt
+
+# -----------------------
+# 텔레그램 봇 설정
+# -----------------------
+BOT_TOKEN = "TOKEN"
+CHAT_ID = "ID"
+
+def send_telegram_message(text: str):
+    """텔레그램 메시지 전송 함수"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text
+    }
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"[텔레그램 전송 오류] {e}")
+
+# -----------------------
+# 업비트 API 키 설정
+# -----------------------
+API_KEY = "access_key"
+SECRET_KEY = "secret_key"
+upbit = pyupbit.Upbit(API_KEY, SECRET_KEY)
+
+# -----------------------
+# 매매 설정
+# -----------------------
+TICKER = "KRW-BTC"
+INTERVAL = "minute15"
+BOLLINGER_WINDOW = 20
+STOP_LOSS_PERCENT = -2.5
+COOLDOWN_TIME = 30 * 60
+MAX_TRADE_KRW = 50000
+
+last_trade_time = None
+position = None
+buy_price = None
+
+# -----------------------
+# 함수 정의
+# -----------------------
+def get_bollinger_bands(df, window=20):
+    """볼린저 밴드 계산"""
+    if df is None or len(df) < window:
+        raise ValueError("볼린저 밴드 계산을 위한 충분한 데이터가 없습니다.")
+    df['MA'] = df['close'].rolling(window=window).mean()
+    df['STD'] = df['close'].rolling(window=window).std()
+    df['Upper'] = df['MA'] + (df['STD'] * 2)
+    df['Lower'] = df['MA'] - (df['STD'] * 2)
+    return df
+
+def get_ohlcv(ticker, interval):
+    """캔들 데이터 가져오기"""
+    df = pyupbit.get_ohlcv(ticker, interval=interval)
+    if df is None or len(df) < BOLLINGER_WINDOW:
+        raise ValueError("캔들 데이터를 가져오지 못했거나 기간이 부족합니다.")
+    return df
+
+def check_buy_condition(df):
+    """매수 조건 체크: 종가가 볼린저 밴드 하단선을 상향 돌파"""
+    prev_close = df['close'].iloc[-2]
+    prev_lower = df['Lower'].iloc[-2]
+    curr_close = df['close'].iloc[-1]
+    curr_lower = df['Lower'].iloc[-1]
+    
+    if pd.isna(prev_close) or pd.isna(prev_lower) or pd.isna(curr_close) or pd.isna(curr_lower):
+        return False
+    
+    return (prev_close <= prev_lower) and (curr_close > curr_lower)
+
+def check_sell_condition(df):
+    """매도 조건 체크: 종가가 볼린저 밴드 상단선을 상향 돌파"""
+    prev_close = df['close'].iloc[-2]
+    prev_upper = df['Upper'].iloc[-2]
+    curr_close = df['close'].iloc[-1]
+    curr_upper = df['Upper'].iloc[-1]
+    
+    if pd.isna(prev_close) or pd.isna(prev_upper) or pd.isna(curr_close) or pd.isna(curr_upper):
+        return False
+    
+    return (prev_close <= prev_upper) and (curr_close > curr_upper)
+
+def check_stop_loss(buy_price, current_price):
+    """손절 조건 체크"""
+    if buy_price is None or current_price is None:
+        return False
+    
+    target_price = buy_price * (1 + STOP_LOSS_PERCENT / 100)
+    return current_price <= target_price
+
+def print_balance(now):
+    """잔고 확인 함수"""
+    krw_balance = upbit.get_balance("KRW")
+    coin_balance = upbit.get_balance(TICKER)
+    current_price = pyupbit.get_current_price(TICKER)
+    
+    if krw_balance is None:
+        krw_balance = 0.0
+    if coin_balance is None:
+        coin_balance = 0.0
+    if current_price is None:
+        raise Exception("현재가 조회 불가")
+    
+    total_balance = krw_balance + float(coin_balance) * current_price
+    
+    print(f"==== 잔고 확인 ({now}) ====")
+    print(f"KRW 잔액: {krw_balance:,.0f}원")
+    print(f"{TICKER} 보유량: {coin_balance}개")
+    print(f"총 평가금액: {total_balance:,.0f}원")
+    print("==================")
+
+def is_candle_closed(now):
+    """현재 시간이 30분봉 마감 시점인지 확인"""
+    return ((now.minute == 0) or (now.minute == 30)) and (now.second < 30)
+
+# -----------------------
+# 실행부
+# -----------------------
+last_balance_check = datetime.datetime.now()
+
+while True:
+    now = datetime.datetime.now()
+    try:
+        if (now - last_balance_check).total_seconds() >= 1800:
+            print_balance(now)
+            last_balance_check = now
+        
+        if is_candle_closed(now):
+            df = get_ohlcv(TICKER, INTERVAL)
+            df = get_bollinger_bands(df, BOLLINGER_WINDOW)
+            
+            current_price = pyupbit.get_current_price(TICKER)
+            if current_price is None:
+                raise ValueError("현재가 조회 불가")
+
+            if last_trade_time and (now - last_trade_time).total_seconds() < COOLDOWN_TIME:
+                print(f"[{now}] 매수 제한 시간 중...")
+                time.sleep(30)
+                continue
+
+            if position is None and check_buy_condition(df):
+                krw_balance = upbit.get_balance("KRW")
+                if krw_balance is None:
+                    krw_balance = 0.0
+
+                if krw_balance > 5000:
+                    trade_amount = min(krw_balance * 0.9995, MAX_TRADE_KRW)
+                    
+                    if trade_amount >= 5000:
+                        upbit.buy_market_order(TICKER, trade_amount)
+                        buy_price = current_price
+                        position = "long"
+                        msg_text = f"비트코인 매수 체결\n매수 가격: {buy_price:,.0f}원"
+                        print(f"[{now}] {msg_text}, 매수금액: {trade_amount:.0f}원")
+                        send_telegram_message(msg_text)
+                    else:
+                        print(f"[{now}] 매수 금액이 5,000원 미만: ({trade_amount:.0f}원)")
+                else:
+                    print(f"[{now}] 잔액 부족으로 매수 불가 (KRW={krw_balance:,.0f})")
+            
+            elif position == "long" and check_sell_condition(df):
+                coin_balance = upbit.get_balance(TICKER)
+                if coin_balance is None:
+                    coin_balance = 0.0
+                upbit.sell_market_order(TICKER, coin_balance)
+                last_trade_time = now
+                position = None
+                msg_text = f"비트코인 매도 체결\n매도 가격: {current_price:,.0f}원"
+                print(f"[{now}] {msg_text}")
+                send_telegram_message(msg_text)
+                buy_price = None
+            
+            elif position == "long" and check_stop_loss(buy_price, current_price):
+                coin_balance = upbit.get_balance(TICKER)
+                if coin_balance is None:
+                    coin_balance = 0.0
+                upbit.sell_market_order(TICKER, coin_balance)
+                last_trade_time = now
+                position = None
+                msg_text = f"비트코인 청산(손절)\n청산 가격: {current_price:,.0f}원"
+                print(f"[{now}] {msg_text}")
+                send_telegram_message(msg_text)
+                buy_price = None
+
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"[{datetime.datetime.now()}] 에러 발생: {e}")
+        time.sleep(60)
